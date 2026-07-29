@@ -4,10 +4,33 @@ import { program } from "commander";
 import { launchBrowser, killBrowser, BrowserType, BrowserInstance } from "./launcher.js";
 import { takeSnapshot, formatSnapshotAsText } from "./snapshot.js";
 import { formatAgentOutput, formatError } from "./output.js";
+import { inspectScene, formatSceneInfo } from "./webgl.js";
 import puppeteer from "puppeteer-core";
 
 let browser: BrowserInstance | null = null;
 let page: import("puppeteer-core").Page | null = null;
+
+// ── Persistent session support ────────────────────────────────────────
+let persistentBrowser: BrowserInstance | null = null;
+let persistentPage: import("puppeteer-core").Page | null = null;
+let persistentPuppeteer: import("puppeteer-core").Browser | null = null;
+
+interface ConsoleMsg { type: string; text: string; ts: number }
+interface NetReq { url: string; method: string; status: number | null; error: string | null; resourceType: string; ts: number }
+
+const consoleLog: ConsoleMsg[] = [];
+const networkLog: NetReq[] = [];
+
+function onConsole(msg: import("puppeteer-core").ConsoleMessage) {
+  consoleLog.push({ type: msg.type(), text: msg.text(), ts: Date.now() });
+}
+function onRequestFailed(req: import("puppeteer-core").HTTPRequest) {
+  networkLog.push({ url: req.url(), method: req.method(), status: null, error: req.failure()?.errorText || "Unknown", resourceType: req.resourceType(), ts: Date.now() });
+}
+function onRequestFinished(req: import("puppeteer-core").HTTPRequest) {
+  const resp = req.response();
+  networkLog.push({ url: req.url(), method: req.method(), status: resp?.status() || 0, error: null, resourceType: req.resourceType(), ts: Date.now() });
+}
 
 program
   .name("browser-cli")

@@ -327,7 +327,22 @@ The Gauntlet Loop skill is available globally at `~/.config/opencode/skills/gaun
 ## Development
 
 ```bash
-# Build
+## AI Agent Skill
+
+This repo includes an embedded **skill** at `.agents/skills/browser-cli/SKILL.md` that teaches AI coding agents (OpenCode, Claude Code, Cursor, etc.) how to use browser-cli for web automation.
+
+| File | What it is |
+|------|------------|
+| `.agents/skills/browser-cli/SKILL.md` | The skill — all commands, output format, session mode, 3D debugging |
+| `.agents/agents.md` | Instructions for agents working on this codebase |
+| `.agents/claude.md` | Claude Code-specific project setup |
+| `AGENTS.md` | Root-only pointer to the skill |
+
+When you update browser-cli commands or behavior, update the skill too so AI agents stay in sync.
+
+---
+
+## Build
 npm run build
 
 # Dev with hot reload

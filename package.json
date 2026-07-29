@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Browser automation CLI for AI agents. Termux-optimized. 26 commands: goto, click, type, screenshot, snapshot, cookies, eval. Clean text + base64 output for multimodal models (Claude Code, OpenCode, Gemini).",
   "bin": {
-    "browser-cli": "./dist/cli.js"
+    "browser-cli": "dist/cli.js"
   },
   "files": [
     "dist/",
