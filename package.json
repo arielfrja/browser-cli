@@ -1,8 +1,8 @@
 {
   "name": "@arielfrja/browser-cli",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "Browser automation CLI for AI agents. Termux-optimized. 26 commands: goto, click, type, screenshot, snapshot, cookies, eval. Clean text + base64 output for multimodal models (Claude Code, OpenCode, Gemini).",
+  "description": "Browser automation CLI for AI agents. Direct CDP (no Puppeteer/Playwright). 39 commands: goto, click, type, screenshot, snapshot, 3D scene inspect, JS breakpoints. Clean text + base64 output for multimodal models.",
   "bin": {
     "browser-cli": "dist/cli.js"
   },
@@ -24,8 +24,7 @@
     "cli",
     "termux",
     "ai-agent",
-    "puppeteer",
-    "playwright",
+    "cdp-native",
     "cdp",
     "headless",
     "chromium",
@@ -50,10 +49,11 @@
   },
   "dependencies": {
     "commander": "^12.0.0",
-    "puppeteer-core": "^23.0.0"
+    "ws": "^8.21.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.0.0",
     "typescript": "^5.6.0"
   }

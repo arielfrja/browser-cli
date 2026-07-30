@@ -132,11 +132,13 @@ export async function launchBrowser(
 
   const proc = spawn(browserPath, args, {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
     env: {
       ...process.env,
       DISPLAY: process.env.DISPLAY || "",
     },
   });
+  proc.unref();
 
   // Suppress Chromium noise on Termux (D-Bus, inotify, NETLINK are harmless)
   // AI agents should get clean stdout without browser stderr pollution.

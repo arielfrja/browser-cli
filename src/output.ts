@@ -16,6 +16,7 @@ export function formatAgentOutput(params: {
   message: string;
   screenshotBase64?: string;
   snapshotText?: string;
+  consoleText?: string;
   success?: boolean;
   startTime: number;
 }): string {
@@ -23,6 +24,12 @@ export function formatAgentOutput(params: {
   const lines: string[] = [];
 
   lines.push(`<!-- browser-cli result: ${params.success !== false ? "OK" : "FAIL"} (${elapsed}ms) -->`);
+
+  if (params.consoleText) {
+    lines.push("");
+    lines.push("--- CONSOLE LOG ---");
+    lines.push(params.consoleText);
+  }
 
   if (params.snapshotText) {
     lines.push("");

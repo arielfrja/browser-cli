@@ -1,66 +1,319 @@
 #!/usr/bin/env node
-
 import { program } from "commander";
 import { launchBrowser, killBrowser, BrowserType, BrowserInstance } from "./launcher.js";
+import { inspectScene, formatSceneInfo } from "./webgl.js";
+import { PageDebugger } from "./debugger.js";
+import { CdpConnection, createPageConnection, sendPage, evaluate, getPageUrl, getPageTitle } from "./cdp.js";
 import { takeSnapshot, formatSnapshotAsText } from "./snapshot.js";
 import { formatAgentOutput, formatError } from "./output.js";
-import { inspectScene, formatSceneInfo } from "./webgl.js";
-import puppeteer from "puppeteer-core";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 
+// ── Globals ───────────────────────────────────────────────────────────────
+let conn: CdpConnection | null = null;
+let sessionId = "";
+let targetId = "";
 let browser: BrowserInstance | null = null;
-let page: import("puppeteer-core").Page | null = null;
+let pageUrl = "";
 
-// ── Persistent session support ────────────────────────────────────────
 let persistentBrowser: BrowserInstance | null = null;
-let persistentPage: import("puppeteer-core").Page | null = null;
-let persistentPuppeteer: import("puppeteer-core").Browser | null = null;
+let persistentConn: CdpConnection | null = null;
+let persistentSessionId = "";
+let persistentTargetId = "";
+let pageDebugger: PageDebugger | null = null;
 
 interface ConsoleMsg { type: string; text: string; ts: number }
-interface NetReq { url: string; method: string; status: number | null; error: string | null; resourceType: string; ts: number }
-
 const consoleLog: ConsoleMsg[] = [];
+interface NetReq { method: string; url: string; resourceType: string; status?: number; error?: string; ts: number }
 const networkLog: NetReq[] = [];
 
-function onConsole(msg: import("puppeteer-core").ConsoleMessage) {
-  consoleLog.push({ type: msg.type(), text: msg.text(), ts: Date.now() });
+// ── Session persistence ───────────────────────────────────────────────────
+const BROWSER_STORE = join(homedir(), ".browser-cli", "session.json");
+function loadBrowserSession(): { wsEndpoint?: string; port?: number; targetId?: string } | null {
+  try { if (existsSync(BROWSER_STORE)) return JSON.parse(readFileSync(BROWSER_STORE, "utf8")); } catch {}
+  return null;
 }
-function onRequestFailed(req: import("puppeteer-core").HTTPRequest) {
-  networkLog.push({ url: req.url(), method: req.method(), status: null, error: req.failure()?.errorText || "Unknown", resourceType: req.resourceType(), ts: Date.now() });
+function saveBrowserSession(data: { wsEndpoint?: string; port?: number; targetId?: string }) {
+  try { if (!existsSync(join(homedir(), ".browser-cli"))) mkdirSync(join(homedir(), ".browser-cli"), { recursive: true }); writeFileSync(BROWSER_STORE, JSON.stringify(data)); } catch {}
 }
-function onRequestFinished(req: import("puppeteer-core").HTTPRequest) {
-  const resp = req.response();
-  networkLog.push({ url: req.url(), method: req.method(), status: resp?.status() || 0, error: null, resourceType: req.resourceType(), ts: Date.now() });
+function clearBrowserSession() { try { writeFileSync(BROWSER_STORE, "{}"); } catch {} }
+
+// ── Event handlers ────────────────────────────────────────────────────────
+function cdpConsoleHandler(params: any) {
+  const type = params.type || "log";
+  const args = params.args || [];
+  const texts = args.map((a: any) => {
+    if (a.value !== undefined) return String(a.value);
+    if (a.description) return a.description;
+    return JSON.stringify(a);
+  });
+  consoleLog.push({ type, text: texts.join(" "), ts: Date.now() });
+}
+function cdpNetRequestHandler(params: any) {
+  const req = params.request || {};
+  networkLog.push({ method: req.method || "?", url: req.url || "?", resourceType: params.type || "?", ts: Date.now() });
+}
+function cdpNetFailedHandler(params: any) {
+  const entry = networkLog.find(n => n.url === params.request?.url);
+  if (entry) entry.error = params.errorText || "failed";
+  else networkLog.push({ method: params.request?.method || "?", url: params.request?.url || "?", resourceType: params.type || "?", error: params.errorText || "failed", ts: Date.now() });
+}
+function cdpNetResponseHandler(params: any) {
+  const entry = networkLog.find(n => n.url === params.request?.url);
+  if (entry) entry.status = params.response?.status;
 }
 
+// ── ensureBrowser ─────────────────────────────────────────────────────────
+async function ensureBrowser(): Promise<void> {
+  const keep = program.getOptionValue("keep") as boolean;
+
+  if (keep && persistentConn) {
+    conn = persistentConn;
+    sessionId = persistentSessionId;
+    targetId = persistentTargetId;
+    pageUrl = await getPageUrl(conn, sessionId);
+    return;
+  }
+  if (conn) return;
+  if (browser) return;
+
+  const browserType = program.getOptionValue("browser") as BrowserType;
+  const headless = program.getOptionValue("headless") !== "false";
+  const port = program.getOptionValue("port") as number | undefined;
+  const w = parseInt(program.getOptionValue("width") as string);
+  const h = parseInt(program.getOptionValue("height") as string);
+
+  // Cross-process reconnect — open fresh tab in existing browser
+  if (keep && !persistentConn) {
+    const saved = loadBrowserSession();
+    if (saved?.wsEndpoint && saved?.targetId) {
+      try {
+        const cc = new CdpConnection(saved.wsEndpoint);
+        // Try to use existing targetId first
+        let activeSid = "";
+        let activeTid = saved.targetId;
+        try {
+          const att = await cc.send("Target.attachToTarget", { targetId: activeTid, flatten: true });
+          activeSid = att.sessionId;
+        } catch { activeTid = ""; }
+
+        // If saved target failed, create a new page
+        if (!activeSid) {
+          const cr = await cc.send("Target.createTarget", { url: "about:blank" });
+          activeTid = cr.targetId;
+          const att = await cc.send("Target.attachToTarget", { targetId: activeTid, flatten: true });
+          activeSid = att.sessionId;
+        }
+
+        conn = cc;
+        sessionId = activeSid;
+        targetId = activeTid;
+        pageUrl = await getPageUrl(cc, activeSid);
+
+        conn.on("Runtime.consoleAPICalled", cdpConsoleHandler);
+        await sendPage(cc, activeSid, "Page.enable");
+        await sendPage(cc, activeSid, "Runtime.enable");
+        await sendPage(cc, activeSid, "Network.enable");
+        conn.on("Network.requestWillBeSent", cdpNetRequestHandler);
+        conn.on("Network.loadingFailed", cdpNetFailedHandler);
+        conn.on("Network.responseReceived", cdpNetResponseHandler);
+
+        persistentConn = cc;
+        persistentSessionId = activeSid;
+        persistentTargetId = activeTid;
+
+        pageDebugger = new PageDebugger();
+        pageDebugger.useStore = true;
+        await pageDebugger.init(cc, activeSid);
+        return;
+      } catch { /* reconnect failed, launch fresh */ }
+    }
+  }
+
+  // Fresh launch
+  const b = await launchBrowser(browserType, { headless, port });
+  browser = b;
+  const cc = new CdpConnection(b.wsEndpoint);
+  const pcinfo = await createPageConnection(cc);
+  conn = cc;
+  sessionId = pcinfo.sessionId;
+  targetId = pcinfo.targetId;
+  pageUrl = await getPageUrl(conn, sessionId);
+
+  // Enable domains
+  await sendPage(conn, sessionId, "Page.enable");
+  await sendPage(conn, sessionId, "Runtime.enable");
+  await sendPage(conn, sessionId, "Network.enable");
+  conn.on("Runtime.consoleAPICalled", cdpConsoleHandler);
+  conn.on("Network.requestWillBeSent", cdpNetRequestHandler);
+  conn.on("Network.loadingFailed", cdpNetFailedHandler);
+  conn.on("Network.responseReceived", cdpNetResponseHandler);
+
+  // Init debugger
+  pageDebugger = new PageDebugger();
+  pageDebugger.useStore = keep;
+  await pageDebugger.init(conn, sessionId);
+
+  // Set viewport
+  await sendPage(conn, sessionId, "Emulation.setDeviceMetricsOverride", {
+    width: w, height: h, deviceScaleFactor: 1, mobile: false,
+  });
+
+  if (keep) {
+    persistentConn = conn;
+    persistentSessionId = sessionId;
+    persistentTargetId = targetId;
+    persistentBrowser = browser;
+    saveBrowserSession({ wsEndpoint: b.wsEndpoint, port: b.port, targetId });
+  }
+}
+
+// ── outputResult ──────────────────────────────────────────────────────────
+async function outputResult(params: {
+  start: number;
+  message?: string;
+  screenshot?: boolean | string;
+  snapshot?: boolean | string;
+  console?: boolean | string;
+}): Promise<void> {
+  let screenshotB64: string | undefined;
+  let snapshotText: string | undefined;
+  let consoleText: string | undefined;
+
+  if (params.screenshot) {
+    const r = await sendPage(conn!, sessionId, "Page.captureScreenshot", { format: "png", fromSurface: true });
+    if (r?.data) screenshotB64 = r.data;
+  }
+  if (params.snapshot) {
+    const snap = await takeSnapshot(conn!, sessionId, pageUrl);
+    snapshotText = formatSnapshotAsText(snap);
+  }
+  if (params.console) {
+    const lines = consoleLog.map(m => `[${m.type}] ${m.text}`);
+    consoleText = lines.length > 0 ? lines.join("\n") : "(no console messages)";
+  }
+
+  console.log(
+    formatAgentOutput({
+      message: params.message || `Navigated to ${pageUrl}`,
+      screenshotBase64: screenshotB64,
+      snapshotText,
+      consoleText,
+      success: true,
+      startTime: params.start,
+    })
+  );
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+async function cdpNavigate(url: string): Promise<void> {
+  await sendPage(conn!, sessionId, "Page.navigate", { url });
+  await sleep(3000);
+  pageUrl = await getPageUrl(conn!, sessionId);
+}
+
+async function cdpClick(selector: string): Promise<void> {
+  const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+    expression: `(() => {
+      const el = document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
+      if (!el) return { error: "Element not found" };
+      const rect = el.getBoundingClientRect();
+      return { x: rect.x + rect.width/2, y: rect.y + rect.height/2 };
+    })()`,
+    returnByValue: true,
+  });
+  const pos = r?.result?.value;
+  if (pos?.error) throw new Error(pos.error);
+  await sendPage(conn!, sessionId, "Input.dispatchMouseEvent", {
+    type: "mousePressed", x: pos.x, y: pos.y, button: "left", clickCount: 1,
+  });
+  await sendPage(conn!, sessionId, "Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: pos.x, y: pos.y, button: "left", clickCount: 1,
+  });
+}
+
+async function cdpType(selector: string, text: string): Promise<void> {
+  await sendPage(conn!, sessionId, "Runtime.evaluate", {
+    expression: `document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')?.focus()`,
+    returnByValue: true,
+  });
+  for (const ch of text) {
+    await sendPage(conn!, sessionId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch });
+    await sendPage(conn!, sessionId, "Input.dispatchKeyEvent", { type: "keyUp", text: ch });
+  }
+}
+
+async function cdpSelect(selector: string, value: string): Promise<void> {
+  await sendPage(conn!, sessionId, "Runtime.evaluate", {
+    expression: `(() => {
+      const el = document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
+      if (!el) return;
+      el.value = '${value.replace(/'/g, "\\'")}';
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`,
+    returnByValue: true,
+  });
+}
+
+async function cdpGetText(selector: string): Promise<string> {
+  const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+    expression: `(() => {
+      const el = document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
+      return el ? el.innerText || el.textContent || el.value || "" : "";
+    })()`,
+    returnByValue: true,
+  });
+  return r?.result?.value || "";
+}
+
+async function cleanup(): Promise<void> {
+  const keep = program.getOptionValue("keep") as boolean;
+  if (keep) return;
+  if (browser) {
+    try { conn?.close(); } catch {}
+    try { await killBrowser(browser); } catch {}
+    conn = null;
+    browser = null;
+    sessionId = "";
+    targetId = "";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ════════════════════ COMMANDS ═══════════════════════════════════════════
+
+// ── Program config ────────────────────────────────────────────────────────
 program
   .name("browser-cli")
-  .description("Browser automation CLI for AI agents. Termux-optimized. Supports Chromium + Firefox.")
-  .version("1.0.0")
+  .description("Browser automation CLI for AI agents. Direct CDP — no Puppeteer/Playwright.")
+  .version("1.1.0")
   .option("--browser <type>", "Browser type: chromium, firefox, auto", "auto")
-  .option("--headless <bool>", "Run headless", "true")
-  .option("--port <number>", "Remote debugging port", (v) => parseInt(v))
+  .option("--headless <bool>", "Headless mode (true/false)", "true")
   .option("--width <px>", "Viewport width", "1280")
-  .option("--height <px>", "Viewport height", "720");
+  .option("--height <px>", "Viewport height", "720")
+  .option("--timeout <ms>", "Command timeout", "30000")
+  .option("--keep", "Keep browser alive across commands (use 'quit' to stop)")
+  .option("--port <number>", "Remote debugging port");
 
-// ── goto ─────────────────────────────────────────────────────────────────
+// ── goto ──────────────────────────────────────────────────────────────────
 program
   .command("goto")
   .argument("<url>", "URL to navigate to")
-  .option("--wait-until <event>", "waitUntil: load, domcontentloaded, networkidle0", "networkidle0")
-  .option("--timeout <ms>", "Navigation timeout", "30000")
   .option("--screenshot", "Include screenshot")
   .option("--snapshot", "Include page snapshot")
+  .option("--console", "Include console logs in output")
   .description("Navigate to a URL and return page state")
   .action(async (url, opts) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.goto(url, {
-        waitUntil: opts.waitUntil as any,
-        timeout: parseInt(opts.timeout),
-      });
-      await sleep(500);
-      await outputResult({ start, message: `Navigated to ${url}`, screenshot: opts.screenshot, snapshot: opts.snapshot });
+      await cdpNavigate(url);
+      pageUrl = url;
+      await outputResult({ start, message: `Navigated to ${url}`, ...opts });
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -74,8 +327,9 @@ program
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.goBack({ waitUntil: "networkidle0" });
-      await outputResult({ start, message: `Navigated back to ${page!.url()}`, screenshot: opts.screenshot });
+      await sendPage(conn!, sessionId, "Page.navigateToHistoryEntry", { entryId: -1 });
+      pageUrl = await getPageUrl(conn!, sessionId);
+      await outputResult({ start, message: `Navigated back to ${pageUrl}`, screenshot: opts.screenshot });
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -89,8 +343,9 @@ program
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.goForward({ waitUntil: "networkidle0" });
-      await outputResult({ start, message: `Navigated forward to ${page!.url()}`, screenshot: opts.screenshot });
+      await sendPage(conn!, sessionId, "Page.navigateToHistoryEntry", { entryId: 1 });
+      pageUrl = await getPageUrl(conn!, sessionId);
+      await outputResult({ start, message: `Navigated forward to ${pageUrl}`, screenshot: opts.screenshot });
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -99,13 +354,41 @@ program
 program
   .command("refresh")
   .option("--screenshot", "Include screenshot")
-  .description("Reload the current page")
+  .description("Reload current page")
   .action(async (opts) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.reload({ waitUntil: "networkidle0" });
-      await outputResult({ start, message: "Page reloaded", screenshot: opts.screenshot });
+      await sendPage(conn!, sessionId, "Page.reload");
+      pageUrl = await getPageUrl(conn!, sessionId);
+      await outputResult({ start, message: `Reloaded ${pageUrl}`, screenshot: opts.screenshot });
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── title ─────────────────────────────────────────────────────────────────
+program
+  .command("title")
+  .description("Get page title")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const t = await getPageTitle(conn!, sessionId);
+      console.log(formatAgentOutput({ message: t, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── url ───────────────────────────────────────────────────────────────────
+program
+  .command("url")
+  .description("Get current page URL")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      console.log(formatAgentOutput({ message: pageUrl, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -115,16 +398,14 @@ program
   .command("click")
   .argument("<selector>", "CSS selector to click")
   .option("--screenshot", "Include screenshot")
-  .option("--snapshot", "Include page snapshot")
   .description("Click an element on the page")
   .action(async (selector, opts) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.waitForSelector(selector, { timeout: 10000 });
-      await page!.click(selector);
-      await sleep(500);
-      await outputResult({ start, message: `Clicked "${selector}"`, screenshot: opts.screenshot, snapshot: opts.snapshot });
+      await cdpClick(selector);
+      pageUrl = await getPageUrl(conn!, sessionId);
+      await outputResult({ start, message: `Clicked ${selector}`, screenshot: opts.screenshot });
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -132,24 +413,15 @@ program
 // ── type ──────────────────────────────────────────────────────────────────
 program
   .command("type")
-  .argument("<selector>", "CSS selector for input")
+  .argument("<selector>", "CSS selector for input element")
   .argument("<text>", "Text to type")
-  .option("--clear", "Clear field before typing", "true")
-  .option("--delay <ms>", "Delay between keystrokes", "10")
-  .option("--screenshot", "Include screenshot")
   .description("Type text into an input field")
-  .action(async (selector, text, opts) => {
+  .action(async (selector, text) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.waitForSelector(selector, { timeout: 10000 });
-      if (opts.clear !== "false") {
-        await page!.click(selector, { clickCount: 3 });
-        await page!.type(selector, "", { delay: 5 });
-      }
-      await page!.type(selector, text, { delay: parseInt(opts.delay) });
-      await sleep(300);
-      await outputResult({ start, message: `Typed "${text.slice(0, 200)}" into "${selector}"`, screenshot: opts.screenshot });
+      await cdpType(selector, text);
+      console.log(formatAgentOutput({ message: `Typed '${text}' into ${selector}`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -159,14 +431,28 @@ program
   .command("select")
   .argument("<selector>", "CSS selector for <select> element")
   .argument("<value>", "Option value to select")
-  .description("Select an option in a <select> element")
+  .description("Select an option from a <select> element")
   .action(async (selector, value) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.waitForSelector(selector, { timeout: 10000 });
-      await page!.select(selector, value);
-      console.log(formatAgentOutput({ message: `Selected "${value}" in "${selector}"`, success: true, startTime: start }));
+      await cdpSelect(selector, value);
+      console.log(formatAgentOutput({ message: `Selected '${value}' in ${selector}`, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── text ──────────────────────────────────────────────────────────────────
+program
+  .command("text")
+  .argument("<selector>", "CSS selector to get text from")
+  .description("Get text content of an element")
+  .action(async (selector) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const t = await cdpGetText(selector);
+      console.log(formatAgentOutput({ message: t || "(empty)", success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -175,73 +461,88 @@ program
 program
   .command("hover")
   .argument("<selector>", "CSS selector to hover over")
-  .option("--screenshot", "Include screenshot")
-  .description("Hover over an element")
-  .action(async (selector, opts) => {
+  .description("Hover over an element on the page")
+  .action(async (selector) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.waitForSelector(selector, { timeout: 10000 });
-      await page!.hover(selector);
-      await outputResult({ start, message: `Hovered "${selector}"`, screenshot: opts.screenshot });
+      const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: `(() => {
+          const el = document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
+          if (!el) return { error: "Element not found" };
+          const rect = el.getBoundingClientRect();
+          return { x: rect.x + rect.width/2, y: rect.y + rect.height/2 };
+        })()`,
+        returnByValue: true,
+      });
+      const pos = r?.result?.value;
+      if (pos?.error) throw new Error(pos.error);
+      await sendPage(conn!, sessionId, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: pos.x, y: pos.y,
+      });
+      console.log(formatAgentOutput({ message: `Hovered over ${selector}`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── scroll ────────────────────────────────────────────────────────────────
+// ── dblclick ──────────────────────────────────────────────────────────────
 program
-  .command("scroll")
-  .argument("<x>", "Scroll X pixels (or '0')")
-  .argument("<y>", "Scroll Y pixels")
-  .description("Scroll the page by x, y pixels")
-  .action(async (x, y) => {
+  .command("dblclick")
+  .argument("<selector>", "CSS selector to double-click")
+  .description("Double-click an element on the page")
+  .action(async (selector) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.evaluate((dx, dy) => window.scrollBy(dx, dy), parseInt(x), parseInt(y));
-      console.log(formatAgentOutput({ message: `Scrolled by (${x}, ${y})`, success: true, startTime: start }));
+      const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: `(() => {
+          const el = document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');
+          if (!el) return { error: "Element not found" };
+          const rect = el.getBoundingClientRect();
+          return { x: rect.x + rect.width/2, y: rect.y + rect.height/2 };
+        })()`,
+        returnByValue: true,
+      });
+      const pos = r?.result?.value;
+      if (pos?.error) throw new Error(pos.error);
+      await sendPage(conn!, sessionId, "Input.dispatchMouseEvent", {
+        type: "mousePressed", x: pos.x, y: pos.y, button: "left", clickCount: 2,
+      });
+      await sendPage(conn!, sessionId, "Input.dispatchMouseEvent", {
+        type: "mouseReleased", x: pos.x, y: pos.y, button: "left", clickCount: 2,
+      });
+      console.log(formatAgentOutput({ message: `Double-clicked ${selector}`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── press ─────────────────────────────────────────────────────────────────
+// ── dialog-accept ─────────────────────────────────────────────────────────
 program
-  .command("press")
-  .argument("<key>", "Key to press (e.g. Enter, Escape, Tab, ArrowDown)")
-  .description("Press a keyboard key")
-  .action(async (key) => {
+  .command("dialog-accept")
+  .argument("[promptText]", "Optional text to provide for prompt() dialogs")
+  .description("Accept a JavaScript dialog (alert/confirm/prompt)")
+  .action(async (promptText) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.keyboard.press(key as any);
-      await sleep(200);
-      console.log(formatAgentOutput({ message: `Pressed "${key}"`, success: true, startTime: start }));
+      const params: any = { accept: true };
+      if (promptText) params.promptText = promptText;
+      await sendPage(conn!, sessionId, "Page.handleJavaScriptDialog", params);
+      console.log(formatAgentOutput({ message: "Dialog accepted", success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── extract ───────────────────────────────────────────────────────────────
+// ── dialog-dismiss ────────────────────────────────────────────────────────
 program
-  .command("extract")
-  .argument("[selector]", "CSS selector (defaults to body)")
-  .option("--attr <name>", "Attribute to extract")
-  .option("--html", "Get inner HTML instead of text")
-  .description("Extract text, HTML, or attributes from an element")
-  .action(async (selector, opts) => {
+  .command("dialog-dismiss")
+  .description("Dismiss a JavaScript dialog (alert/confirm/prompt)")
+  .action(async () => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      const sel = selector || "body";
-      await page!.waitForSelector(sel, { timeout: 10000 });
-      let content: string;
-      if (opts.attr) {
-        content = await page!.$eval(sel, (el, name) => el.getAttribute(name as string) || "", opts.attr);
-      } else if (opts.html) {
-        content = await page!.$eval(sel, (el) => (el as HTMLElement).innerHTML);
-      } else {
-        content = await page!.$eval(sel, (el) => (el as HTMLElement).innerText);
-      }
-      console.log(formatAgentOutput({ message: content.trim(), success: true, startTime: start }));
+      await sendPage(conn!, sessionId, "Page.handleJavaScriptDialog", { accept: false });
+      console.log(formatAgentOutput({ message: "Dialog dismissed", success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -249,32 +550,27 @@ program
 // ── screenshot ────────────────────────────────────────────────────────────
 program
   .command("screenshot")
-  .argument("[path]", "File path to save screenshot")
-  .option("--full-page", "Capture full page (not just viewport)")
-  .option("--selector <sel>", "Element selector to capture")
-  .option("--base64", "Output base64 to stdout", "true")
-  .description("Capture a screenshot")
-  .action(async (path, opts) => {
+  .description("Capture page screenshot as base64")
+  .action(async () => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      let buf: Buffer;
-      if (opts.selector) {
-        const el = await page!.$(opts.selector);
-        if (!el) throw new Error(`Element "${opts.selector}" not found`);
-        buf = (await el.screenshot({ encoding: "binary" })) as Buffer;
-      } else {
-        buf = (await page!.screenshot({ fullPage: !!opts["full-page"], encoding: "binary" })) as Buffer;
-      }
-      if (path) {
-        const { writeFile } = await import("fs/promises");
-        await writeFile(path, buf);
-        console.log(formatAgentOutput({ message: `Screenshot saved to ${path} (${buf.length} bytes)`, success: true, startTime: start }));
-      } else if (opts.base64 !== "false") {
-        console.log(formatAgentOutput({ message: `Screenshot (${buf.length} bytes)`, screenshotBase64: buf.toString("base64"), success: true, startTime: start }));
-      } else {
-        process.stdout.write(buf);
-      }
+      const r = await sendPage(conn!, sessionId, "Page.captureScreenshot", { format: "png", fromSurface: true });
+      console.log(formatAgentOutput({ message: "Screenshot captured", screenshotBase64: r?.data, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── pdf ───────────────────────────────────────────────────────────────────
+program
+  .command("pdf")
+  .description("Generate PDF of current page")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const r = await sendPage(conn!, sessionId, "Page.printToPDF");
+      console.log(formatAgentOutput({ message: "PDF generated (base64)", screenshotBase64: r?.data, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
@@ -282,282 +578,588 @@ program
 // ── snapshot ──────────────────────────────────────────────────────────────
 program
   .command("snapshot")
-  .description("Capture full page state as structured text")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
+  .description("Get structured page snapshot (headings, links, inputs, text)")
+  .action(async () => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      const snap = await takeSnapshot(page!);
-      if (opts.json) {
-        console.log(JSON.stringify(snap, null, 2));
+      const snap = await takeSnapshot(conn!, sessionId, pageUrl);
+      const text = formatSnapshotAsText(snap);
+      console.log(formatAgentOutput({ message: text, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── find ──────────────────────────────────────────────────────────────────
+program
+  .command("find")
+  .argument("<pattern>", "Text or regex pattern to search for")
+  .option("-r, --regex", "Interpret pattern as regex")
+  .description("Search the page snapshot for matching text")
+  .action(async (pattern, opts) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const snap = await takeSnapshot(conn!, sessionId, pageUrl);
+      const text = formatSnapshotAsText(snap);
+      const lines = text.split("\n");
+      const matches: { line: number; text: string }[] = [];
+      if (opts.regex) {
+        const re = new RegExp(pattern, "gi");
+        lines.forEach((l, i) => { if (re.test(l)) matches.push({ line: i + 1, text: l.trim() }); });
       } else {
-        console.log(formatAgentOutput({ message: formatSnapshotAsText(snap), success: true, startTime: start }));
+        const lower = pattern.toLowerCase();
+        lines.forEach((l, i) => { if (l.toLowerCase().includes(lower)) matches.push({ line: i + 1, text: l.trim() }); });
+      }
+      if (!matches.length) {
+        console.log(formatAgentOutput({ message: `No matches for "${pattern}"`, success: true, startTime: start }));
+      } else {
+        const msg = matches.slice(0, 50).map(m => `${m.line}: ${m.text}`).join("\n");
+        const tail = matches.length > 50 ? `\n... and ${matches.length - 50} more` : "";
+        console.log(formatAgentOutput({ message: `Found ${matches.length} match(es) for "${pattern}"\n${msg}${tail}`, success: true, startTime: start }));
       }
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── wait ──────────────────────────────────────────────────────────────────
+// ── eval ──────────────────────────────────────────────────────────────────
 program
-  .command("wait")
-  .argument("<ms>", "Milliseconds to wait")
-  .option("--screenshot", "Include screenshot")
-  .description("Wait for a specified time")
-  .action(async (ms, opts) => {
+  .command("eval")
+  .argument("<code>", "JavaScript code to execute")
+  .description("Run arbitrary JavaScript in the page")
+  .action(async (code) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await sleep(parseInt(ms));
-      await outputResult({ start, message: `Waited ${ms}ms`, screenshot: opts.screenshot });
+      const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: code,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      if (r.exceptionDetails) {
+        console.log(formatAgentOutput({ message: `Error: ${r.exceptionDetails.text || r.exceptionDetails.exception?.description}`, success: false, startTime: start }));
+      } else {
+        const val = r.result?.value !== undefined ? JSON.stringify(r.result.value, null, 2) : r.result?.description || "(undefined)";
+        console.log(formatAgentOutput({ message: val, success: true, startTime: start }));
+      }
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── wait-for ──────────────────────────────────────────────────────────────
-program
-  .command("wait-for")
-  .argument("<selector>", "CSS selector to wait for")
-  .option("--timeout <ms>", "Timeout", "10000")
-  .option("--hidden", "Wait for element to be hidden instead of visible")
-  .description("Wait for an element to appear (or disappear)")
-  .action(async (selector, opts) => {
-    const start = Date.now();
-    try {
-      await ensureBrowser();
-      const hidden = opts.hidden ? true : false;
-      await page!.waitForSelector(selector, { timeout: parseInt(opts.timeout), hidden });
-      console.log(formatAgentOutput({ message: `Element "${selector}" ${hidden ? "hidden" : "visible"}`, success: true, startTime: start }));
-    } catch (e) { console.log(formatError(e, start)); }
-    finally { await cleanup(); }
-  });
-
-// ── cookies (get) ─────────────────────────────────────────────────────────
+// ── cookies ───────────────────────────────────────────────────────────────
 program
   .command("cookies")
-  .description("Get all cookies (pass --json for formatted output)")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
+  .description("List all cookies for current page")
+  .action(async () => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      const cookies = await page!.cookies();
-      const out = opts.json
-        ? JSON.stringify(cookies, null, 2)
-        : cookies.map((c) => `${c.name}=${c.value} (${c.domain})`).join("\n");
-      console.log(formatAgentOutput({ message: out || "(no cookies)", success: true, startTime: start }));
+      const r = await sendPage(conn!, sessionId, "Network.getCookies", { urls: [pageUrl] });
+      const cookies = r?.cookies || [];
+      const lines = cookies.map((c: any) => `${c.name}=${c.value} (domain: ${c.domain}, path: ${c.path})`);
+      console.log(formatAgentOutput({ message: lines.length ? lines.join("\n") : "(no cookies)", success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── set-cookie ────────────────────────────────────────────────────────────
+// ── clear-cookies ─────────────────────────────────────────────────────────
 program
-  .command("set-cookie")
-  .argument("<name>", "Cookie name")
-  .argument("<value>", "Cookie value")
-  .description("Set a cookie on the current page")
-  .action(async (name, value) => {
+  .command("clear-cookies")
+  .description("Clear all cookies")
+  .action(async () => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.setCookie({ name, value, url: page!.url() });
+      await sendPage(conn!, sessionId, "Network.clearBrowserCookies");
+      console.log(formatAgentOutput({ message: "Cookies cleared", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── cookie-get ────────────────────────────────────────────────────────────
+program
+  .command("cookie-get")
+  .argument("<name>", "Cookie name")
+  .description("Get the value of a specific cookie")
+  .action(async (name) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const r = await sendPage(conn!, sessionId, "Network.getCookies", { urls: [pageUrl] });
+      const c = (r?.cookies || []).find((c: any) => c.name === name);
+      if (!c) throw new Error(`Cookie "${name}" not found`);
+      console.log(formatAgentOutput({ message: `${c.name}=${c.value} (domain: ${c.domain})`, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── cookie-set ────────────────────────────────────────────────────────────
+program
+  .command("cookie-set")
+  .argument("<name>", "Cookie name")
+  .argument("<value>", "Cookie value")
+  .option("--domain <domain>", "Cookie domain", "localhost")
+  .option("--path <path>", "Cookie path", "/")
+  .description("Set a cookie")
+  .action(async (name, value, opts) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      await sendPage(conn!, sessionId, "Network.setCookie", { name, value, domain: opts.domain, path: opts.path });
       console.log(formatAgentOutput({ message: `Cookie set: ${name}=${value}`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── delete-cookies ────────────────────────────────────────────────────────
+// ── cookie-delete ─────────────────────────────────────────────────────────
 program
-  .command("delete-cookies")
-  .argument("[names...]", "Cookie names to delete (all if empty)")
-  .description("Delete cookies")
-  .action(async (names) => {
+  .command("cookie-delete")
+  .argument("<name>", "Cookie name")
+  .description("Delete a specific cookie")
+  .action(async (name) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      if (names && names.length > 0) {
-        for (const n of names) await page!.deleteCookie({ name: n });
-      } else {
-        const all = await page!.cookies();
-        for (const c of all) await page!.deleteCookie({ name: c.name });
+      const r = await sendPage(conn!, sessionId, "Network.getCookies", { urls: [pageUrl] });
+      const cookies = (r?.cookies || []).filter((c: any) => c.name === name);
+      for (const c of cookies) {
+        await sendPage(conn!, sessionId, "Network.deleteCookies", { name: c.name, url: pageUrl, domain: c.domain, path: c.path });
       }
-      console.log(formatAgentOutput({ message: "Cookies deleted", success: true, startTime: start }));
+      console.log(formatAgentOutput({ message: `Cookie "${name}" deleted`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── storage (localStorage get) ────────────────────────────────────────────
+// ── storage ───────────────────────────────────────────────────────────────
 program
-  .command("storage-get")
+  .command("storage")
+  .description("Show browser storage info (localStorage, sessionStorage)")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: `JSON.stringify({ localStorage: Object.entries(localStorage).map(([k,v])=>k+'='+v), sessionStorage: Object.entries(sessionStorage).map(([k,v])=>k+'='+v) })`,
+        returnByValue: true,
+      });
+      const data = JSON.parse(r?.result?.value || "{}");
+      const lines: string[] = [];
+      if (data.localStorage?.length) lines.push("localStorage:", ...data.localStorage.map((s: string) => `  ${s}`));
+      if (data.sessionStorage?.length) lines.push("sessionStorage:", ...data.sessionStorage.map((s: string) => `  ${s}`));
+      if (!lines.length) lines.push("(no storage data)");
+      console.log(formatAgentOutput({ message: lines.join("\n"), success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── clear-storage ─────────────────────────────────────────────────────────
+program
+  .command("clear-storage")
+  .description("Clear localStorage and sessionStorage")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      await sendPage(conn!, sessionId, "Runtime.evaluate", { expression: "localStorage.clear(); sessionStorage.clear()", returnByValue: true });
+      console.log(formatAgentOutput({ message: "Storage cleared", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── localstorage-get ──────────────────────────────────────────────────────
+program
+  .command("localstorage-get")
   .argument("<key>", "localStorage key")
   .description("Get a localStorage value")
   .action(async (key) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      const val = await page!.evaluate((k) => localStorage.getItem(k), key);
-      console.log(formatAgentOutput({ message: val !== null ? `${key}=${val}` : `(no value for "${key}")`, success: true, startTime: start }));
+      const r = await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: `localStorage.getItem('${key.replace(/'/g, "\\'")}')`,
+        returnByValue: true,
+      });
+      const val = r?.result?.value;
+      console.log(formatAgentOutput({ message: val !== null ? `${key}=${val}` : `Key "${key}" not found in localStorage`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── storage-set (localStorage set) ────────────────────────────────────────
+// ── localstorage-set ──────────────────────────────────────────────────────
 program
-  .command("storage-set")
+  .command("localstorage-set")
   .argument("<key>", "localStorage key")
-  .argument("<value>", "localStorage value")
+  .argument("<value>", "Value to store")
   .description("Set a localStorage value")
   .action(async (key, value) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.evaluate((k, v) => localStorage.setItem(k, v), key, value);
-      console.log(formatAgentOutput({ message: `${key}=${value} set`, success: true, startTime: start }));
+      await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: `localStorage.setItem('${key.replace(/'/g, "\\'")}','${value.replace(/'/g, "\\'")}')`,
+        returnByValue: true,
+      });
+      console.log(formatAgentOutput({ message: `localStorage set: ${key}=${value}`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── storage-clear (localStorage clear) ────────────────────────────────────
+// ── localstorage-delete ───────────────────────────────────────────────────
 program
-  .command("storage-clear")
-  .description("Clear all localStorage")
-  .action(async () => {
+  .command("localstorage-delete")
+  .argument("<key>", "localStorage key")
+  .description("Delete a localStorage key")
+  .action(async (key) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      await page!.evaluate(() => localStorage.clear());
-      console.log(formatAgentOutput({ message: "localStorage cleared", success: true, startTime: start }));
+      await sendPage(conn!, sessionId, "Runtime.evaluate", {
+        expression: `localStorage.removeItem('${key.replace(/'/g, "\\'")}')`,
+        returnByValue: true,
+      });
+      console.log(formatAgentOutput({ message: `localStorage key "${key}" deleted`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
 
-// ── list-browsers ─────────────────────────────────────────────────────────
+// ── state-save ────────────────────────────────────────────────────────────
 program
-  .command("list-browsers")
-  .description("Detect available browsers on this system")
-  .action(async () => {
-    const { getChromeExecutable, getFirefoxExecutable } = await import("./launcher.js");
-    const chrome = await getChromeExecutable();
-    const ff = await getFirefoxExecutable();
-    const lines: string[] = ["Available browsers:"];
-    if (chrome) lines.push(`  ✓ Chromium: ${chrome}`);
-    else lines.push("  ✗ Chromium: not found (pkg install chromium)");
-    if (ff) lines.push(`  ✓ Firefox: ${ff}`);
-    else lines.push("  ✗ Firefox: not found (pkg install firefox)");
-    console.log(lines.join("\n"));
-  });
-
-// ── eval ──────────────────────────────────────────────────────────────────
-program
-  .command("eval")
-  .argument("<code>", "JavaScript code to execute in the page")
-  .option("--arg <json>", "JSON argument passed to the function")
-  .description("Run arbitrary JavaScript in the browser page")
-  .action(async (code, opts) => {
+  .command("state-save")
+  .argument("[filename]", "Output file (default: browser-state.json in current dir)")
+  .description("Save cookies + localStorage to a JSON file")
+  .action(async (filename) => {
     const start = Date.now();
     try {
       await ensureBrowser();
-      let result: unknown;
-      if (opts.arg) {
-        const arg = JSON.parse(opts.arg);
-        result = await page!.evaluate((a) => {
-          try { return eval(code); } catch (e) { return (e as Error).message; }
-        }, arg);
-      } else {
-        result = await page!.evaluate(code);
+      const file = filename || "browser-state.json";
+      const [cr, lr] = await Promise.all([
+        sendPage(conn!, sessionId, "Network.getCookies", { urls: [pageUrl] }),
+        sendPage(conn!, sessionId, "Runtime.evaluate", {
+          expression: "JSON.stringify(Object.entries(localStorage).map(([k,v])=>({name:k,value:v})))",
+          returnByValue: true,
+        }),
+      ]);
+      const cookies = cr?.cookies || [];
+      const localItems = JSON.parse(lr?.result?.value || "[]");
+      const state = { url: pageUrl, cookies, localStorage: localItems, savedAt: new Date().toISOString() };
+      writeFileSync(file, JSON.stringify(state, null, 2));
+      console.log(formatAgentOutput({ message: `State saved to ${file} (${cookies.length} cookies, ${localItems.length} localStorage items)`, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── state-load ────────────────────────────────────────────────────────────
+program
+  .command("state-load")
+  .argument("<filename>", "JSON state file to load")
+  .description("Restore cookies + localStorage from a JSON file")
+  .action(async (filename) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const raw = readFileSync(filename, "utf8");
+      const state = JSON.parse(raw);
+      if (state.cookies) {
+        for (const c of state.cookies) {
+          try { await sendPage(conn!, sessionId, "Network.setCookie", { name: c.name, value: c.value, domain: c.domain || "localhost", path: c.path || "/" }); } catch {}
+        }
       }
+      if (state.localStorage) {
+        for (const item of state.localStorage) {
+          await sendPage(conn!, sessionId, "Runtime.evaluate", {
+            expression: `localStorage.setItem('${item.name.replace(/'/g, "\\'")}','${String(item.value).replace(/'/g, "\\'")}')`,
+            returnByValue: true,
+          });
+        }
+      }
+      console.log(formatAgentOutput({ message: `State loaded from ${filename}`, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── scene ─────────────────────────────────────────────────────────────────
+program
+  .command("scene")
+  .description("Inspect 3D scene (Three.js/Babylon.js/WebGL)")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const info = await inspectScene(conn!, sessionId);
+      const msg = formatSceneInfo(info);
+      console.log(formatAgentOutput({ message: msg, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── console ───────────────────────────────────────────────────────────────
+program
+  .command("console")
+  .option("--clear", "Clear the console buffer after reading")
+  .description("Show buffered console messages")
+  .action(async (opts) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const lines = consoleLog.map(m => `[${m.type}] ${m.text}`);
+      const msg = lines.length > 0 ? lines.join("\n") : "(no console messages)";
+      if (opts.clear) consoleLog.length = 0;
+      console.log(formatAgentOutput({ message: msg, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── network ───────────────────────────────────────────────────────────────
+program
+  .command("network")
+  .option("--all", "Show all requests (default: only failed/errored)")
+  .option("--clear", "Clear the network buffer after reading")
+  .description("Show buffered network requests")
+  .action(async (opts) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      const filtered = opts.all ? networkLog : networkLog.filter(r => r.error || (r.status && r.status >= 400));
+      const lines = filtered.map(r => {
+        const status = r.error ? `FAIL: ${r.error}` : `${r.status}`;
+        return `${r.method} ${r.resourceType} ${status} ${r.url}`;
+      });
+      const msg = lines.length > 0 ? lines.join("\n") : "(no network requests)";
+      if (opts.clear) networkLog.length = 0;
+      console.log(formatAgentOutput({ message: msg, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── quit ──────────────────────────────────────────────────────────────────
+program
+  .command("quit")
+  .description("Kill the persistent browser session started with --keep")
+  .action(async () => {
+    if (persistentConn) {
+      try { persistentConn?.close(); } catch {}
+      try { if (persistentBrowser) await killBrowser(persistentBrowser); } catch {}
+      persistentConn = null;
+      persistentBrowser = null;
+      persistentSessionId = "";
+      persistentTargetId = "";
+      clearBrowserSession();
+      console.log(formatAgentOutput({ message: "Browser session ended", success: true, startTime: Date.now() }));
+    } else {
+      const saved = loadBrowserSession();
+      if (saved?.port) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${saved.port}/json/version`);
+          if (res.ok) {
+            // Browser is still running, can't kill without process ref
+          }
+        } catch {}
+        clearBrowserSession();
+      }
+      console.log(formatAgentOutput({ message: "No active persistent session", success: true, startTime: Date.now() }));
+    }
+    process.exit(0);
+  });
+
+// ── close-all ─────────────────────────────────────────────────────────────
+program
+  .command("close-all")
+  .description("Close all active browser sessions")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      if (persistentConn) {
+        try { persistentConn?.close(); } catch {}
+        try { if (persistentBrowser) await killBrowser(persistentBrowser); } catch {}
+        persistentConn = null;
+        persistentBrowser = null;
+        persistentSessionId = "";
+        persistentTargetId = "";
+      }
+      conn = null;
+      browser = null;
+      sessionId = "";
+      targetId = "";
+      clearBrowserSession();
+      console.log(formatAgentOutput({ message: "All browser sessions closed", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+  });
+
+// ── kill-all ──────────────────────────────────────────────────────────────
+program
+  .command("kill-all")
+  .description("Forcefully kill all browser processes")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      if (persistentConn) { try { persistentConn?.close(); } catch {} }
+      if (persistentBrowser) { try { await killBrowser(persistentBrowser); } catch {} }
+      if (browser) { try { await killBrowser(browser); } catch {} }
+      persistentConn = null;
+      persistentBrowser = null;
+      conn = null;
+      browser = null;
+      sessionId = "";
+      targetId = "";
+      persistentSessionId = "";
+      persistentTargetId = "";
+      clearBrowserSession();
+      console.log(formatAgentOutput({ message: "All browser processes killed", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+  });
+
+// ── debug-set ─────────────────────────────────────────────────────────────
+program
+  .command("debug-set")
+  .argument("<location>", "Breakpoint location as 'file.js:line' (e.g. 'scene.html:45')")
+  .description("Set a JavaScript breakpoint at a file:line location")
+  .action(async (loc) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      const parts = loc.split(":");
+      if (parts.length < 2) throw new Error("Use format: file:line (e.g. scene.html:42)");
+      const line = parseInt(parts.pop()!, 10);
+      const file = parts.join(":");
+      const baseUrl = pageUrl.substring(0, pageUrl.lastIndexOf("/") + 1);
+      const url = file.includes("://") ? file : new URL(file, baseUrl).href;
+      const bp = await pageDebugger.setBreakpoint(url, line - 1);
+      console.log(formatAgentOutput({ message: `Breakpoint set: ${bp.id} at ${url}:${line}`, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-list ────────────────────────────────────────────────────────────
+program
+  .command("debug-list")
+  .description("List all active breakpoints")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      const list = pageDebugger.list();
+      const msg = list.length ? list.map(b => `${b.id}: ${b.url}:${b.line + 1} (${b.enabled ? "enabled" : "disabled"})`).join("\n") : "(no breakpoints set)";
+      console.log(formatAgentOutput({ message: msg, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-remove ──────────────────────────────────────────────────────────
+program
+  .command("debug-remove")
+  .argument("<id>", "Breakpoint ID (e.g. bp-1)")
+  .description("Remove a breakpoint")
+  .action(async (id) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      pageDebugger.remove(id);
+      console.log(formatAgentOutput({ message: `Breakpoint ${id} removed`, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-continue ────────────────────────────────────────────────────────
+program
+  .command("debug-continue")
+  .description("Resume execution after a breakpoint pause")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      if (!pageDebugger.paused) throw new Error("Not paused");
+      await pageDebugger.resume();
+      console.log(formatAgentOutput({ message: "Resumed execution", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-step-over ───────────────────────────────────────────────────────
+program
+  .command("debug-step-over")
+  .description("Step over the next function call")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      if (!pageDebugger.paused) throw new Error("Not paused");
+      await pageDebugger.stepOver();
+      console.log(formatAgentOutput({ message: "Stepped over", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-step-into ───────────────────────────────────────────────────────
+program
+  .command("debug-step-into")
+  .description("Step into the next function call")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      if (!pageDebugger.paused) throw new Error("Not paused");
+      await pageDebugger.stepInto();
+      console.log(formatAgentOutput({ message: "Stepped into", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-step-out ────────────────────────────────────────────────────────
+program
+  .command("debug-step-out")
+  .description("Step out of the current function")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      if (!pageDebugger.paused) throw new Error("Not paused");
+      await pageDebugger.stepOut();
+      console.log(formatAgentOutput({ message: "Stepped out", success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-locals ──────────────────────────────────────────────────────────
+program
+  .command("debug-locals")
+  .description("Show current breakpoint pause state")
+  .action(async () => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      const msg = pageDebugger.paused
+        ? `Paused at breakpoint (${pageDebugger.paused.reason})\nCall stack:\n${pageDebugger.paused.callFrames}\n\nUse \`debug-eval <expr>\` to inspect variables.`
+        : "(not paused)";
+      console.log(formatAgentOutput({ message: msg, success: true, startTime: start }));
+    } catch (e) { console.log(formatError(e, start)); }
+    finally { await cleanup(); }
+  });
+
+// ── debug-eval ────────────────────────────────────────────────────────────
+program
+  .command("debug-eval")
+  .argument("<expression>", "JavaScript expression to evaluate in the paused frame")
+  .description("Evaluate an expression in the paused call frame context")
+  .action(async (expr) => {
+    const start = Date.now();
+    try {
+      await ensureBrowser();
+      if (!pageDebugger) throw new Error("Debugger not initialized");
+      if (!pageDebugger.paused) throw new Error("Not paused (no active breakpoint)");
+      const result = await pageDebugger.evaluate(expr);
       const output = typeof result === "object" ? JSON.stringify(result, null, 2) : String(result);
-      console.log(formatAgentOutput({ message: output, success: true, startTime: start }));
+      console.log(formatAgentOutput({ message: `» ${expr}\n${output}`, success: true, startTime: start }));
     } catch (e) { console.log(formatError(e, start)); }
     finally { await cleanup(); }
   });
-
-// ── url ───────────────────────────────────────────────────────────────────
-program
-  .command("url")
-  .description("Print the current page URL")
-  .action(async () => {
-    const start = Date.now();
-    try {
-      await ensureBrowser();
-      console.log(formatAgentOutput({ message: page!.url(), success: true, startTime: start }));
-    } catch (e) { console.log(formatError(e, start)); }
-    finally { await cleanup(); }
-  });
-
-// ── title ─────────────────────────────────────────────────────────────────
-program
-  .command("title")
-  .description("Print the current page title")
-  .action(async () => {
-    const start = Date.now();
-    try {
-      await ensureBrowser();
-      console.log(formatAgentOutput({ message: await page!.title(), success: true, startTime: start }));
-    } catch (e) { console.log(formatError(e, start)); }
-    finally { await cleanup(); }
-  });
-
-// ════════════════════ HELPERS ═════════════════════════════════════════════
-
-async function ensureBrowser(): Promise<void> {
-  if (browser) return;
-  const browserType = program.getOptionValue("browser") as BrowserType;
-  const headless = program.getOptionValue("headless") !== "false";
-  const port = program.getOptionValue("port") as number | undefined;
-  const w = parseInt(program.getOptionValue("width") as string);
-  const h = parseInt(program.getOptionValue("height") as string);
-
-  browser = await launchBrowser(browserType, { headless, port });
-  const pb = await puppeteer.connect({
-    browserWSEndpoint: browser.wsEndpoint,
-    defaultViewport: { width: w, height: h },
-  });
-  const pages = await pb.pages();
-  page = pages[0] || (await pb.newPage());
-}
-
-async function outputResult(params: {
-  start: number;
-  message?: string;
-  screenshot?: boolean | string;
-  snapshot?: boolean | string;
-}): Promise<void> {
-  let screenshotB64: string | undefined;
-  let snapshotText: string | undefined;
-
-  if (params.screenshot) {
-    const buf = (await page!.screenshot({ encoding: "base64" })) as string;
-    screenshotB64 = buf;
-  }
-  if (params.snapshot) {
-    const snap = await takeSnapshot(page!);
-    snapshotText = formatSnapshotAsText(snap);
-  }
-
-  console.log(
-    formatAgentOutput({
-      message: params.message || `Navigated to ${page!.url()}`,
-      screenshotBase64: screenshotB64,
-      snapshotText,
-      success: true,
-      startTime: params.start,
-    })
-  );
-}
-
-async function cleanup(): Promise<void> {
-  if (browser) {
-    try { await page?.close(); } catch {}
-    try { await killBrowser(browser); } catch {}
-    browser = null;
-    page = null;
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 // ── Run ───────────────────────────────────────────────────────────────────
 program.parse(process.argv);
